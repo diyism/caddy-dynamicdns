@@ -114,7 +114,7 @@ func (sh SimpleHTTP) GetIPs(ctx context.Context, settings IPSettings) ([]netip.A
 					zap.Error(err))
 				continue
 			}
-			sh.logger.Debug("lookup",
+			sh.logger.Info("lookup",
 				zap.String("type", name),
 				zap.String("endpoint", endpoint),
 				zap.String("ip", addr.String()))

@@ -212,7 +212,7 @@ func (a App) checkIPAndUpdateDNS() error {
 			// not the end of the world, but might be an extra initial API hit with the DNS provider
 			a.logger.Error("unable to lookup current IPs from DNS records", zap.Error(err))
 		}
-		a.logger.Debug("looked up current IPs from DNS", zap.Any("lastIPs", lastIPs))
+		a.logger.Info("looked up current IPs from DNS", zap.Any("lastIPs", lastIPs))
 	}
 
 	// Lookup current address(es) from first successful IP source
@@ -267,8 +267,11 @@ func (a App) checkIPAndUpdateDNS() error {
 		}
 	}
 
+	// Always probe UDP port and update _port records (even if IP didn't change)
+	a.updatePortRecords(allDomains)
+
 	if len(updatedRecsByZone) == 0 {
-		a.logger.Debug("no IP address change; no update needed")
+		a.logger.Info("no IP address change; no update needed")
 		return nil
 	}
 
@@ -302,9 +305,6 @@ func (a App) checkIPAndUpdateDNS() error {
 		}
 	}
 
-	// Probe UDP port and update _port records
-	a.updatePortRecords(allDomains)
-
 	currentIPStrings := make([]string, len(currentIPs))
 	for i, val := range currentIPs {
 		currentIPStrings[i] = val.String()
@@ -317,14 +317,14 @@ func (a App) checkIPAndUpdateDNS() error {
 
 // updatePortRecords probes UDP port and updates _port A records
 func (a App) updatePortRecords(allDomains map[string][]string) {
-	port, ok := probeUDPPort()
-	if !ok {
-		a.logger.Debug("UDP port probe failed, skipping port record update")
+	port, err := probeUDPPort()
+	if err != nil {
+		a.logger.Warn("UDP port probe failed, skipping port record update", zap.Error(err))
 		return
 	}
 
 	if port == 0 {
-		a.logger.Debug("UDP port probe: ports don't match, writing 0")
+		a.logger.Info("UDP port probe: ports don't match, writing 0")
 	} else {
 		a.logger.Info("UDP port probe successful", zap.Uint16("port", port))
 	}
@@ -422,7 +422,17 @@ func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) (domainTypeIPs
 			for _, n := range names {
 				name := libdns.AbsoluteName(n, zone)
 				ips := make(map[string][]netip.Addr)
-				for _, t := range []string{recordTypeA, recordTypeAAAA} {
+
+				// Only check record types that are enabled
+				recordTypes := []string{}
+				if a.Versions.V4Enabled() {
+					recordTypes = append(recordTypes, recordTypeA)
+				}
+				if a.Versions.V6Enabled() {
+					recordTypes = append(recordTypes, recordTypeAAAA)
+				}
+
+				for _, t := range recordTypes {
 					if ip, ok := recMap[name][t]; ok {
 						ips[t] = []netip.Addr{ip}
 					} else {
@@ -631,27 +641,27 @@ var udpProbeServers = []string{
 }
 
 // probeUDPPort sends UDP packets to probe servers from source port 443
-// Returns (port, success). If any probe fails, success is false.
-// If probes succeed but ports don't match, returns (0, true).
-func probeUDPPort() (uint16, bool) {
+// Returns (port, error). If any probe fails, returns error.
+// If probes succeed but ports don't match, returns (0, nil).
+func probeUDPPort() (uint16, error) {
 	var detectedPorts []uint16
 
 	for _, server := range udpProbeServers {
 		port, err := sendUDPProbe(server)
 		if err != nil {
-			// Probe failed, return failure
-			return 0, false
+			// Probe failed, return error with server info
+			return 0, fmt.Errorf("probe to %s failed: %w", server, err)
 		}
 		detectedPorts = append(detectedPorts, port)
 	}
 
 	// Check if all detected ports are the same
 	if len(detectedPorts) >= 2 && detectedPorts[0] == detectedPorts[1] {
-		return detectedPorts[0], true
+		return detectedPorts[0], nil
 	}
 
-	// Ports don't match, return 0 but success=true
-	return 0, true
+	// Ports don't match, return 0 but no error
+	return 0, nil
 }
 
 // sendUDPProbe sends a UDP packet from source port 443 and reads the response
