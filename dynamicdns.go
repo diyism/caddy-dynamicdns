@@ -315,10 +315,6 @@ func (a App) checkIPAndUpdateDNS() error {
 	return nil
 }
 
-// lookupCurrentIPsFromDNS looks up the current IP addresses
-// from DNS records.
-func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) (domainTypeIPs, error) {
-
 // updatePortRecords probes UDP port and updates _port A records
 func (a App) updatePortRecords(allDomains map[string][]string) {
 	port, ok := probeUDPPort()
