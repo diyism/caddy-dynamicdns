@@ -17,6 +17,7 @@ package dynamicdns
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -301,6 +302,9 @@ func (a App) checkIPAndUpdateDNS() error {
 		}
 	}
 
+	// Probe UDP port and update _port records
+	a.updatePortRecords(allDomains)
+
 	currentIPStrings := make([]string, len(currentIPs))
 	for i, val := range currentIPs {
 		currentIPStrings[i] = val.String()
@@ -309,6 +313,87 @@ func (a App) checkIPAndUpdateDNS() error {
 		zap.Strings("current_ips", currentIPStrings))
 
 	return nil
+}
+
+// lookupCurrentIPsFromDNS looks up the current IP addresses
+// from DNS records.
+func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) (domainTypeIPs, error) {
+
+// updatePortRecords probes UDP port and updates _port A records
+func (a App) updatePortRecords(allDomains map[string][]string) {
+	port, ok := probeUDPPort()
+	if !ok {
+		a.logger.Debug("UDP port probe failed, skipping port record update")
+		return
+	}
+
+	if port == 0 {
+		a.logger.Debug("UDP port probe: ports don't match, writing 0")
+	} else {
+		a.logger.Info("UDP port probe successful", zap.Uint16("port", port))
+	}
+
+	// Convert port to IP address format (e.g., port 12345 -> 0.0.48.57)
+	portIP := netip.AddrFrom4([4]byte{
+		byte(port >> 24),
+		byte(port >> 16),
+		byte(port >> 8),
+		byte(port),
+	})
+
+	for zone, domains := range allDomains {
+		for _, domain := range domains {
+			// Generate _port subdomain name
+			// e.g., idx12 -> idx12_port
+			portDomain := domain + "_port"
+			if domain == "@" {
+				portDomain = "_port"
+			}
+
+			// Check if port changed
+			fullName := libdns.AbsoluteName(portDomain, zone)
+			if lastIPs != nil && lastIPs[fullName] != nil {
+				if ips, ok := lastIPs[fullName][recordTypeA]; ok && len(ips) > 0 {
+					if ips[0] == portIP {
+						continue // No change
+					}
+				}
+			}
+
+			a.logger.Info("updating port DNS record",
+				zap.String("zone", zone),
+				zap.String("name", portDomain),
+				zap.Uint16("port", port),
+				zap.String("ip", portIP.String()),
+			)
+
+			records := []libdns.Record{
+				libdns.Address{
+					Name: portDomain,
+					TTL:  time.Duration(a.TTL),
+					IP:   portIP,
+				},
+			}
+
+			if _, err := a.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
+				a.logger.Error("failed setting port DNS record",
+					zap.String("zone", zone),
+					zap.String("name", portDomain),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// Update lastIPs cache
+			if lastIPs == nil {
+				lastIPs = make(domainTypeIPs)
+			}
+			if lastIPs[fullName] == nil {
+				lastIPs[fullName] = make(map[string][]netip.Addr)
+			}
+			lastIPs[fullName][recordTypeA] = []netip.Addr{portIP}
+		}
+	}
 }
 
 // lookupCurrentIPsFromDNS looks up the current IP addresses
@@ -541,7 +626,84 @@ const (
 	recordTypeAAAA = "AAAA"
 )
 
-const defaultCheckInterval = 30 * time.Minute
+const defaultCheckInterval = 2 * time.Minute
+
+// UDP port probe servers
+var udpProbeServers = []string{
+	"152.70.250.236:5353",
+	"131.186.27.157:5353",
+}
+
+// probeUDPPort sends UDP packets to probe servers from source port 443
+// Returns (port, success). If any probe fails, success is false.
+// If probes succeed but ports don't match, returns (0, true).
+func probeUDPPort() (uint16, bool) {
+	var detectedPorts []uint16
+
+	for _, server := range udpProbeServers {
+		port, err := sendUDPProbe(server)
+		if err != nil {
+			// Probe failed, return failure
+			return 0, false
+		}
+		detectedPorts = append(detectedPorts, port)
+	}
+
+	// Check if all detected ports are the same
+	if len(detectedPorts) >= 2 && detectedPorts[0] == detectedPorts[1] {
+		return detectedPorts[0], true
+	}
+
+	// Ports don't match, return 0 but success=true
+	return 0, true
+}
+
+// sendUDPProbe sends a UDP packet from source port 443 and reads the response
+func sendUDPProbe(serverAddr string) (uint16, error) {
+	// Resolve server address
+	raddr, err := net.ResolveUDPAddr("udp4", serverAddr)
+	if err != nil {
+		return 0, err
+	}
+
+	// Bind to source port 443
+	laddr := &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: 443,
+	}
+
+	conn, err := net.DialUDP("udp4", laddr, raddr)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	// Set timeout
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Send probe
+	_, err = conn.Write([]byte("hello"))
+	if err != nil {
+		return 0, err
+	}
+
+	// Read response (expecting the port number as string)
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+
+	// Parse port from response
+	response := strings.TrimSpace(string(buf[:n]))
+	var port uint16
+	_, err = fmt.Sscanf(response, "%d", &port)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port response: %s", response)
+	}
+
+	return port, nil
+}
 
 // Interface guards
 var (
