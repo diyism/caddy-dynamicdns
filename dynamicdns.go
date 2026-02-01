@@ -317,19 +317,17 @@ func (a App) checkIPAndUpdateDNS() error {
 	return nil
 }
 
-// updatePortRecords probes UDP port and updates _port A records
+// updatePortRecords probes UDP port and updates both main A records and _port A records
 func (a App) updatePortRecords(allDomains map[string][]string) {
-	port, err := probeUDPPort()
+	publicIP, port, err := probeUDPPort()
 	if err != nil {
 		a.logger.Warn("UDP port probe failed, skipping port record update", zap.Error(err))
 		return
 	}
 
-	if port == 0 {
-		a.logger.Info("UDP port probe: ports don't match, writing 0")
-	} else {
-		a.logger.Info("UDP port probe successful", zap.Uint16("port", port))
-	}
+	a.logger.Info("UDP port probe successful",
+		zap.String("ip", publicIP.String()),
+		zap.Uint16("port", port))
 
 	// Convert port to IP address format (e.g., port 12345 -> 0.0.48.57)
 	portIP := netip.AddrFrom4([4]byte{
@@ -340,56 +338,90 @@ func (a App) updatePortRecords(allDomains map[string][]string) {
 	})
 
 	for zone, domains := range allDomains {
+		var recordsToUpdate []libdns.Record
+
 		for _, domain := range domains {
-			// Generate _port subdomain name
-			// e.g., idx12 -> idx12_port
+			// Update main domain A record with public IP
+			fullName := libdns.AbsoluteName(domain, zone)
+			needsUpdate := true
+			if lastIPs != nil && lastIPs[fullName] != nil {
+				if ips, ok := lastIPs[fullName][recordTypeA]; ok && len(ips) > 0 {
+					if ips[0] == publicIP {
+						needsUpdate = false
+					}
+				}
+			}
+
+			if needsUpdate {
+				a.logger.Info("updating main DNS record from UDP probe",
+					zap.String("zone", zone),
+					zap.String("name", domain),
+					zap.String("ip", publicIP.String()),
+				)
+				recordsToUpdate = append(recordsToUpdate, libdns.Address{
+					Name: domain,
+					TTL:  time.Duration(a.TTL),
+					IP:   publicIP,
+				})
+
+				// Update lastIPs cache for main domain
+				if lastIPs == nil {
+					lastIPs = make(domainTypeIPs)
+				}
+				if lastIPs[fullName] == nil {
+					lastIPs[fullName] = make(map[string][]netip.Addr)
+				}
+				lastIPs[fullName][recordTypeA] = []netip.Addr{publicIP}
+			}
+
+			// Update _port subdomain with port encoded as IP
 			portDomain := domain + "_port"
 			if domain == "@" {
 				portDomain = "_port"
 			}
 
-			// Check if port changed
-			fullName := libdns.AbsoluteName(portDomain, zone)
-			if lastIPs != nil && lastIPs[fullName] != nil {
-				if ips, ok := lastIPs[fullName][recordTypeA]; ok && len(ips) > 0 {
+			portFullName := libdns.AbsoluteName(portDomain, zone)
+			needsPortUpdate := true
+			if lastIPs != nil && lastIPs[portFullName] != nil {
+				if ips, ok := lastIPs[portFullName][recordTypeA]; ok && len(ips) > 0 {
 					if ips[0] == portIP {
-						continue // No change
+						needsPortUpdate = false
 					}
 				}
 			}
 
-			a.logger.Info("updating port DNS record",
-				zap.String("zone", zone),
-				zap.String("name", portDomain),
-				zap.Uint16("port", port),
-				zap.String("ip", portIP.String()),
-			)
-
-			records := []libdns.Record{
-				libdns.Address{
+			if needsPortUpdate {
+				a.logger.Info("updating port DNS record",
+					zap.String("zone", zone),
+					zap.String("name", portDomain),
+					zap.Uint16("port", port),
+					zap.String("ip", portIP.String()),
+				)
+				recordsToUpdate = append(recordsToUpdate, libdns.Address{
 					Name: portDomain,
 					TTL:  time.Duration(a.TTL),
 					IP:   portIP,
-				},
-			}
+				})
 
-			if _, err := a.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
-				a.logger.Error("failed setting port DNS record",
+				// Update lastIPs cache for _port subdomain
+				if lastIPs == nil {
+					lastIPs = make(domainTypeIPs)
+				}
+				if lastIPs[portFullName] == nil {
+					lastIPs[portFullName] = make(map[string][]netip.Addr)
+				}
+				lastIPs[portFullName][recordTypeA] = []netip.Addr{portIP}
+			}
+		}
+
+		// Batch update all records for this zone
+		if len(recordsToUpdate) > 0 {
+			if _, err := a.dnsProvider.SetRecords(a.ctx, zone, recordsToUpdate); err != nil {
+				a.logger.Error("failed setting DNS records",
 					zap.String("zone", zone),
-					zap.String("name", portDomain),
 					zap.Error(err),
 				)
-				continue
 			}
-
-			// Update lastIPs cache
-			if lastIPs == nil {
-				lastIPs = make(domainTypeIPs)
-			}
-			if lastIPs[fullName] == nil {
-				lastIPs[fullName] = make(map[string][]netip.Addr)
-			}
-			lastIPs[fullName][recordTypeA] = []netip.Addr{portIP}
 		}
 	}
 }
@@ -643,35 +675,42 @@ var udpProbeServers = []string{
 }
 
 // probeUDPPort sends UDP packets to probe servers from source port 443
-// Returns (port, error). If any probe fails, returns error.
-// If probes succeed but ports don't match, returns (0, nil).
-func probeUDPPort() (uint16, error) {
+// Returns (ip, port, error). If any probe fails, returns error.
+// If probes succeed but IPs/ports don't match, returns error.
+func probeUDPPort() (netip.Addr, uint16, error) {
+	var detectedIPs []netip.Addr
 	var detectedPorts []uint16
 
 	for _, server := range udpProbeServers {
-		port, err := sendUDPProbe(server)
+		ip, port, err := sendUDPProbe(server)
 		if err != nil {
 			// Probe failed, return error with server info
-			return 0, fmt.Errorf("probe to %s failed: %w", server, err)
+			return netip.Addr{}, 0, fmt.Errorf("probe to %s failed: %w", server, err)
 		}
+		detectedIPs = append(detectedIPs, ip)
 		detectedPorts = append(detectedPorts, port)
 	}
 
-	// Check if all detected ports are the same
-	if len(detectedPorts) >= 2 && detectedPorts[0] == detectedPorts[1] {
-		return detectedPorts[0], nil
+	// Check if all detected IPs are the same
+	if len(detectedIPs) >= 2 && detectedIPs[0] != detectedIPs[1] {
+		return netip.Addr{}, 0, fmt.Errorf("IP mismatch: %s vs %s", detectedIPs[0], detectedIPs[1])
 	}
 
-	// Ports don't match, return 0 but no error
-	return 0, nil
+	// Check if all detected ports are the same
+	if len(detectedPorts) >= 2 && detectedPorts[0] != detectedPorts[1] {
+		return netip.Addr{}, 0, fmt.Errorf("port mismatch: %d vs %d", detectedPorts[0], detectedPorts[1])
+	}
+
+	return detectedIPs[0], detectedPorts[0], nil
 }
 
 // sendUDPProbe sends a UDP packet from source port 443 and reads the response
-func sendUDPProbe(serverAddr string) (uint16, error) {
+// Returns (ip, port, error). Response format is "IP:PORT"
+func sendUDPProbe(serverAddr string) (netip.Addr, uint16, error) {
 	// Resolve server address
 	raddr, err := net.ResolveUDPAddr("udp4", serverAddr)
 	if err != nil {
-		return 0, err
+		return netip.Addr{}, 0, err
 	}
 
 	// Create ListenConfig with socket reuse options
@@ -696,7 +735,7 @@ func sendUDPProbe(serverAddr string) (uint16, error) {
 	// Listen on port 443 with reuse options
 	conn, err := lc.ListenPacket(context.Background(), "udp4", "0.0.0.0:443")
 	if err != nil {
-		return 0, err
+		return netip.Addr{}, 0, err
 	}
 	defer conn.Close()
 
@@ -706,25 +745,37 @@ func sendUDPProbe(serverAddr string) (uint16, error) {
 	// Send probe
 	_, err = conn.WriteTo([]byte("hello"), raddr)
 	if err != nil {
-		return 0, err
+		return netip.Addr{}, 0, err
 	}
 
-	// Read response (expecting the port number as string)
+	// Read response (expecting "IP:PORT" format)
 	buf := make([]byte, 64)
 	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
-		return 0, err
+		return netip.Addr{}, 0, err
 	}
 
-	// Parse port from response
+	// Parse IP:PORT from response
 	response := strings.TrimSpace(string(buf[:n]))
-	var port uint16
-	_, err = fmt.Sscanf(response, "%d", &port)
-	if err != nil {
-		return 0, fmt.Errorf("invalid port response: %s", response)
+	parts := strings.Split(response, ":")
+	if len(parts) != 2 {
+		return netip.Addr{}, 0, fmt.Errorf("invalid response format: %s (expected IP:PORT)", response)
 	}
 
-	return port, nil
+	// Parse IP address
+	ip, err := netip.ParseAddr(parts[0])
+	if err != nil {
+		return netip.Addr{}, 0, fmt.Errorf("invalid IP in response: %s", parts[0])
+	}
+
+	// Parse port
+	var port uint16
+	_, err = fmt.Sscanf(parts[1], "%d", &port)
+	if err != nil {
+		return netip.Addr{}, 0, fmt.Errorf("invalid port in response: %s", parts[1])
+	}
+
+	return ip, port, nil
 }
 
 // Interface guards
