@@ -218,112 +218,11 @@ func (a App) checkIPAndUpdateDNS() error {
 		a.logger.Info("looked up current IPs from DNS", zap.Any("lastIPs", lastIPs))
 	}
 
-	// Lookup current address(es) from first successful IP source
-	var currentIPs []netip.Addr
-	for _, ipSrc := range a.ipSources {
-		ipSettings := IPSettings{a.IPRanges, a.Versions}
-		currentIPs, err = ipSrc.GetIPs(a.ctx, ipSettings)
-		if len(currentIPs) == 0 {
-			err = fmt.Errorf("no IP addresses returned")
-		}
-		if err == nil {
-			break
-		}
-		a.logger.Error("looking up IP address",
-			zap.String("ip_source", ipSrc.(caddy.Module).CaddyModule().ID.Name()),
-			zap.Error(err))
-	}
-
-	// If all IP sources failed, return the error so caller can retry
-	if len(currentIPs) == 0 && err != nil {
-		return fmt.Errorf("all IP sources failed: %w", err)
-	}
-
-	// make sure the source returns tidy info; duplicates are wasteful
-	currentIPs = removeDuplicateIPs(currentIPs)
-
-	// do a diff of current and previous IPs to make DNS records to update
-	updatedRecsByZone := make(map[string][]libdns.Address)
-	for _, ip := range currentIPs {
-		for zone, domains := range allDomains {
-			for _, domain := range domains {
-				oldIps, found := lastIPs[libdns.AbsoluteName(domain, zone)][recordType(ip)]
-				if !found && a.UpdateOnly {
-					a.logger.Debug("record doesn't exist; skipping update",
-						zap.String("zone", zone),
-						zap.String("name", domain),
-					)
-					continue
-				}
-
-				if found && ipListContains(oldIps, ip) {
-					// IP is not different and no new domains to manage; no update needed
-					continue
-				}
-
-				updatedRecsByZone[zone] = append(updatedRecsByZone[zone], libdns.Address{
-					Name: domain,
-					TTL:  time.Duration(a.TTL),
-					IP:   ip,
-				})
-			}
-		}
-	}
-
-	// Always probe UDP port and update _port records (even if IP didn't change)
-	a.updatePortRecords(allDomains)
-
-	if len(updatedRecsByZone) == 0 {
-		a.logger.Info("no IP address change; no update needed")
-		return nil
-	}
-
-	for zone, addresses := range updatedRecsByZone {
-		records := make([]libdns.Record, len(addresses))
-		for i, rec := range addresses {
-			a.logger.Info("updating DNS record",
-				zap.String("zone", zone),
-				zap.String("type", recordType(rec.IP)),
-				zap.String("name", rec.Name),
-				zap.String("ip", rec.IP.String()),
-				zap.Duration("ttl", rec.TTL),
-			)
-			records[i] = rec
-		}
-		if _, err = a.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
-			a.logger.Error("failed setting DNS record(s) with new IP address(es)",
-				zap.String("zone", zone),
-				zap.Error(err),
-			)
-		}
-		for _, rec := range addresses {
-			name := libdns.AbsoluteName(rec.Name, zone)
-			if lastIPs == nil {
-				lastIPs = make(domainTypeIPs)
-			}
-			if lastIPs[name] == nil {
-				lastIPs[name] = make(map[string][]netip.Addr)
-			}
-			lastIPs[name][recordType(rec.IP)] = []netip.Addr{rec.IP}
-		}
-	}
-
-	currentIPStrings := make([]string, len(currentIPs))
-	for i, val := range currentIPs {
-		currentIPStrings[i] = val.String()
-	}
-	a.logger.Info("finished updating DNS",
-		zap.Strings("current_ips", currentIPStrings))
-
-	return nil
-}
-
-// updatePortRecords probes UDP port and updates both main A records and _port A records
-func (a App) updatePortRecords(allDomains map[string][]string) {
+	// Use UDP probe to get public IP and port
 	publicIP, port, err := probeUDPPort()
 	if err != nil {
-		a.logger.Warn("UDP port probe failed, skipping port record update", zap.Error(err))
-		return
+		a.logger.Error("UDP port probe failed", zap.Error(err))
+		return fmt.Errorf("UDP port probe failed: %w", err)
 	}
 
 	a.logger.Info("UDP port probe successful",
@@ -338,11 +237,17 @@ func (a App) updatePortRecords(allDomains map[string][]string) {
 		byte(port),
 	})
 
-	for zone, domains := range allDomains {
-		var recordsToUpdate []libdns.Record
+	// Check which records need updating
+	var recordsToUpdate []struct {
+		zone   string
+		domain string
+		ip     netip.Addr
+		isPort bool
+	}
 
+	for zone, domains := range allDomains {
 		for _, domain := range domains {
-			// Update main domain A record with public IP
+			// Check main domain A record
 			fullName := libdns.AbsoluteName(domain, zone)
 			needsUpdate := true
 			if lastIPs != nil && lastIPs[fullName] != nil {
@@ -354,28 +259,15 @@ func (a App) updatePortRecords(allDomains map[string][]string) {
 			}
 
 			if needsUpdate {
-				a.logger.Info("updating main DNS record from UDP probe",
-					zap.String("zone", zone),
-					zap.String("name", domain),
-					zap.String("ip", publicIP.String()),
-				)
-				recordsToUpdate = append(recordsToUpdate, libdns.Address{
-					Name: domain,
-					TTL:  time.Duration(a.TTL),
-					IP:   publicIP,
-				})
-
-				// Update lastIPs cache for main domain
-				if lastIPs == nil {
-					lastIPs = make(domainTypeIPs)
-				}
-				if lastIPs[fullName] == nil {
-					lastIPs[fullName] = make(map[string][]netip.Addr)
-				}
-				lastIPs[fullName][recordTypeA] = []netip.Addr{publicIP}
+				recordsToUpdate = append(recordsToUpdate, struct {
+					zone   string
+					domain string
+					ip     netip.Addr
+					isPort bool
+				}{zone, domain, publicIP, false})
 			}
 
-			// Update _port subdomain with port encoded as IP
+			// Check _port subdomain
 			portDomain := domain + "_port"
 			if domain == "@" {
 				portDomain = "_port"
@@ -392,39 +284,75 @@ func (a App) updatePortRecords(allDomains map[string][]string) {
 			}
 
 			if needsPortUpdate {
-				a.logger.Info("updating port DNS record",
-					zap.String("zone", zone),
-					zap.String("name", portDomain),
-					zap.Uint16("port", port),
-					zap.String("ip", portIP.String()),
-				)
-				recordsToUpdate = append(recordsToUpdate, libdns.Address{
-					Name: portDomain,
-					TTL:  time.Duration(a.TTL),
-					IP:   portIP,
-				})
-
-				// Update lastIPs cache for _port subdomain
-				if lastIPs == nil {
-					lastIPs = make(domainTypeIPs)
-				}
-				if lastIPs[portFullName] == nil {
-					lastIPs[portFullName] = make(map[string][]netip.Addr)
-				}
-				lastIPs[portFullName][recordTypeA] = []netip.Addr{portIP}
-			}
-		}
-
-		// Batch update all records for this zone
-		if len(recordsToUpdate) > 0 {
-			if _, err := a.dnsProvider.SetRecords(a.ctx, zone, recordsToUpdate); err != nil {
-				a.logger.Error("failed setting DNS records",
-					zap.String("zone", zone),
-					zap.Error(err),
-				)
+				recordsToUpdate = append(recordsToUpdate, struct {
+					zone   string
+					domain string
+					ip     netip.Addr
+					isPort bool
+				}{zone, portDomain, portIP, true})
 			}
 		}
 	}
+
+	if len(recordsToUpdate) == 0 {
+		a.logger.Info("no IP address change; no update needed")
+		return nil
+	}
+
+	// Group records by zone for batch updates
+	recordsByZone := make(map[string][]libdns.Record)
+	for _, rec := range recordsToUpdate {
+		if rec.isPort {
+			a.logger.Info("updating port DNS record",
+				zap.String("zone", rec.zone),
+				zap.String("name", rec.domain),
+				zap.Uint16("port", port),
+				zap.String("ip", rec.ip.String()),
+			)
+		} else {
+			a.logger.Info("updating main DNS record from UDP probe",
+				zap.String("zone", rec.zone),
+				zap.String("name", rec.domain),
+				zap.String("ip", rec.ip.String()),
+			)
+		}
+
+		recordsByZone[rec.zone] = append(recordsByZone[rec.zone], libdns.Address{
+			Name: rec.domain,
+			TTL:  time.Duration(a.TTL),
+			IP:   rec.ip,
+		})
+	}
+
+	// Update DNS records
+	for zone, records := range recordsByZone {
+		if _, err := a.dnsProvider.SetRecords(a.ctx, zone, records); err != nil {
+			a.logger.Error("failed setting DNS record(s)",
+				zap.String("zone", zone),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Update lastIPs cache
+		for _, rec := range records {
+			addr := rec.(libdns.Address)
+			fullName := libdns.AbsoluteName(addr.Name, zone)
+			if lastIPs == nil {
+				lastIPs = make(domainTypeIPs)
+			}
+			if lastIPs[fullName] == nil {
+				lastIPs[fullName] = make(map[string][]netip.Addr)
+			}
+			lastIPs[fullName][recordTypeA] = []netip.Addr{addr.IP}
+		}
+	}
+
+	a.logger.Info("finished updating DNS",
+		zap.String("public_ip", publicIP.String()),
+		zap.Uint16("port", port))
+
+	return nil
 }
 
 // lookupCurrentIPsFromDNS looks up the current IP addresses
