@@ -15,12 +15,14 @@
 package dynamicdns
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -672,13 +674,27 @@ func sendUDPProbe(serverAddr string) (uint16, error) {
 		return 0, err
 	}
 
-	// Bind to source port 443
-	laddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: 443,
+	// Create ListenConfig with socket reuse options
+	lc := &net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockOptErr error
+			if err := c.Control(func(fd uintptr) {
+				// Set SO_REUSEADDR to allow reusing the address
+				sockOptErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				if sockOptErr != nil {
+					return
+				}
+				// Set SO_REUSEPORT to allow multiple sockets to bind to the same port
+				sockOptErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+			return sockOptErr
+		},
 	}
 
-	conn, err := net.DialUDP("udp4", laddr, raddr)
+	// Listen on port 443 with reuse options
+	conn, err := lc.ListenPacket(context.Background(), "udp4", "0.0.0.0:443")
 	if err != nil {
 		return 0, err
 	}
@@ -688,14 +704,14 @@ func sendUDPProbe(serverAddr string) (uint16, error) {
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// Send probe
-	_, err = conn.Write([]byte("hello"))
+	_, err = conn.WriteTo([]byte("hello"), raddr)
 	if err != nil {
 		return 0, err
 	}
 
 	// Read response (expecting the port number as string)
 	buf := make([]byte, 64)
-	n, err := conn.Read(buf)
+	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return 0, err
 	}
