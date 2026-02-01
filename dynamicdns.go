@@ -29,6 +29,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/libdns/libdns"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -719,12 +720,12 @@ func sendUDPProbe(serverAddr string) (netip.Addr, uint16, error) {
 			var sockOptErr error
 			if err := c.Control(func(fd uintptr) {
 				// Set SO_REUSEADDR to allow reusing the address
-				sockOptErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				sockOptErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
 				if sockOptErr != nil {
 					return
 				}
 				// Set SO_REUSEPORT to allow multiple sockets to bind to the same port
-				sockOptErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+				sockOptErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 			}); err != nil {
 				return err
 			}
